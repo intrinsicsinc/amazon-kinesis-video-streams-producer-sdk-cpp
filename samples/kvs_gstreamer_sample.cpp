@@ -45,6 +45,7 @@ LOGGER_TAG("com.amazonaws.kinesis.video.gstreamer");
 #define DEFAULT_REPLAY_DURATION_SECONDS 40
 #define DEFAULT_CONNECTION_STALENESS_SECONDS 60
 #define DEFAULT_CODEC_ID "V_MPEG4/ISO/AVC"
+#define DEFAULT_CODEC_ID_H265 "V_MPEGH/ISO/HEVC"
 #define DEFAULT_TRACKNAME "kinesis_video"
 #define DEFAULT_FRAME_DURATION_MS 1
 #define DEFAULT_CREDENTIAL_ROTATION_SECONDS 3600
@@ -55,6 +56,11 @@ typedef enum _StreamSource {
     LIVE_SOURCE,
     RTSP_SOURCE
 } StreamSource;
+
+typedef enum _VideoCodec {
+    VIDEO_CODEC_H264,
+    VIDEO_CODEC_H265
+} VideoCodec;
 
 typedef struct _FileInfo {
     _FileInfo():
@@ -77,7 +83,8 @@ typedef struct _CustomData {
             key_frame_pts(0),
             main_loop(NULL),
             first_pts(GST_CLOCK_TIME_NONE),
-            use_absolute_fragment_times(true) {
+            use_absolute_fragment_times(true),
+            videoCodec(VIDEO_CODEC_H264) {
         producer_start_time = chrono::duration_cast<nanoseconds>(systemCurrentTime().time_since_epoch()).count();
     }
 
@@ -134,7 +141,54 @@ typedef struct _CustomData {
 
     // Pts of first video frame
     uint64_t first_pts;
+
+    VideoCodec videoCodec;
 } CustomData;
+
+static bool is_h265_codec(const string& codec) {
+    return STRCMPI(codec.c_str(), "h265") == 0 || STRCMPI(codec.c_str(), "hevc") == 0;
+}
+
+static bool is_h264_codec(const string& codec) {
+    return STRCMPI(codec.c_str(), "h264") == 0 || STRCMPI(codec.c_str(), "avc") == 0;
+}
+
+static bool parse_codec_arg(const string& codec, VideoCodec* videoCodec) {
+    if (is_h264_codec(codec)) {
+        *videoCodec = VIDEO_CODEC_H264;
+        return true;
+    }
+
+    if (is_h265_codec(codec)) {
+        *videoCodec = VIDEO_CODEC_H265;
+        return true;
+    }
+
+    return false;
+}
+
+static bool is_live_option(const string& arg) {
+    return STRCMPI(arg.c_str(), "-w") == 0 ||
+           STRCMPI(arg.c_str(), "/w") == 0 ||
+           STRCMPI(arg.c_str(), "--w") == 0 ||
+           STRCMPI(arg.c_str(), "-h") == 0 ||
+           STRCMPI(arg.c_str(), "/h") == 0 ||
+           STRCMPI(arg.c_str(), "--h") == 0 ||
+           STRCMPI(arg.c_str(), "-f") == 0 ||
+           STRCMPI(arg.c_str(), "/f") == 0 ||
+           STRCMPI(arg.c_str(), "--f") == 0 ||
+           STRCMPI(arg.c_str(), "-b") == 0 ||
+           STRCMPI(arg.c_str(), "/b") == 0 ||
+           STRCMPI(arg.c_str(), "--b") == 0;
+}
+
+static const char* get_content_type(VideoCodec videoCodec) {
+    return videoCodec == VIDEO_CODEC_H265 ? "video/h265" : DEFAULT_CONTENT_TYPE;
+}
+
+static const char* get_codec_id(VideoCodec videoCodec) {
+    return videoCodec == VIDEO_CODEC_H265 ? DEFAULT_CODEC_ID_H265 : DEFAULT_CODEC_ID;
+}
 
 namespace com { namespace amazonaws { namespace kinesis { namespace video {
 
@@ -566,7 +620,7 @@ void kinesis_video_stream_init(CustomData *data) {
         &tags,
         DEFAULT_KMS_KEY_ID,
         streaming_type,
-        DEFAULT_CONTENT_TYPE,
+        get_content_type(data->videoCodec),
         duration_cast<milliseconds> (seconds(DEFAULT_MAX_LATENCY_SECONDS)),
         milliseconds(DEFAULT_FRAGMENT_DURATION_MILLISECONDS),
         milliseconds(DEFAULT_TIMECODE_SCALE_MILLISECONDS),
@@ -583,7 +637,7 @@ void kinesis_video_stream_init(CustomData *data) {
         seconds(DEFAULT_BUFFER_DURATION_SECONDS),
         seconds(DEFAULT_REPLAY_DURATION_SECONDS),
         seconds(DEFAULT_CONNECTION_STALENESS_SECONDS),
-        DEFAULT_CODEC_ID,
+        get_codec_id(data->videoCodec),
         DEFAULT_TRACKNAME,
         nullptr,
         0));
@@ -902,26 +956,34 @@ int gstreamer_live_source_init(int argc, char* argv[], CustomData *data, GstElem
 
 int gstreamer_rtsp_source_init(CustomData *data, GstElement *pipeline) {
 
-    GstElement *filter, *appsink, *depay, *source, *h264parse;
+    GstElement *filter, *appsink, *depay, *source, *parse;
+    const bool is_h265 = data->videoCodec == VIDEO_CODEC_H265;
+    const char* depay_name = is_h265 ? "rtph265depay" : "rtph264depay";
+    const char* parse_name = is_h265 ? "h265parse" : "h264parse";
+    const char* media_type = is_h265 ? "video/x-h265" : "video/x-h264";
 
     filter = gst_element_factory_make("capsfilter", "filter");
     appsink = gst_element_factory_make("appsink", "appsink");
-    depay = gst_element_factory_make("rtph264depay", "depay");
+    depay = gst_element_factory_make(depay_name, "depay");
     source = gst_element_factory_make("rtspsrc", "source");
-    h264parse = gst_element_factory_make("h264parse", "h264parse");
+    parse = gst_element_factory_make(parse_name, "parse");
 
-    if (!pipeline || !source || !depay || !appsink || !filter || !h264parse) {
+    if (!pipeline || !source || !depay || !appsink || !filter || !parse) {
         g_printerr("Not all elements could be created.\n");
         return 1;
     }
 
     // configure filter
-    GstCaps *h264_caps = gst_caps_new_simple("video/x-h264",
-                                             "stream-format", G_TYPE_STRING, "avc",
-                                             "alignment", G_TYPE_STRING, "au",
-                                             NULL);
-    g_object_set(G_OBJECT (filter), "caps", h264_caps, NULL);
-    gst_caps_unref(h264_caps);
+    GstCaps *codec_caps = gst_caps_new_simple(media_type,
+                                              "alignment", G_TYPE_STRING, "au",
+                                              NULL);
+    if (!is_h265) {
+        gst_caps_set_simple(codec_caps,
+                            "stream-format", G_TYPE_STRING, "avc",
+                            NULL);
+    }
+    g_object_set(G_OBJECT (filter), "caps", codec_caps, NULL);
+    gst_caps_unref(codec_caps);
 
     // configure appsink
     g_object_set(G_OBJECT (appsink), "emit-signals", TRUE, "sync", FALSE, NULL);
@@ -937,11 +999,11 @@ int gstreamer_rtsp_source_init(CustomData *data, GstElement *pipeline) {
 
     /* build the pipeline */
     gst_bin_add_many(GST_BIN (pipeline), source,
-                     depay, h264parse, filter, appsink,
+                     depay, parse, filter, appsink,
                      NULL);
 
     /* Leave the actual source out - this will be done when the pad is added */
-    if (!gst_element_link_many(depay, filter, h264parse,
+    if (!gst_element_link_many(depay, filter, parse,
                                appsink,
                                NULL)) {
 
@@ -1092,7 +1154,7 @@ int main(int argc, char* argv[]) {
         LOG_ERROR(
                 "Usage: AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name -w width -h height -f framerate -b bitrateInKBPS\n \
            or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name\n \
-           or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name rtsp-url\n \
+           or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name rtsp-url [--codec h264|h265]\n \
            or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name path/to/file1 path/to/file2 ...\n");
         return 1;
     }
@@ -1111,33 +1173,51 @@ int main(int argc, char* argv[]) {
 
     data.streamSource = LIVE_SOURCE;
     if (argc > 2) {
-        string third_arg = string(argv[2]);
-        // config options for live source begin with -
-        if (third_arg[0] != '-') {
-            string prefix = third_arg.substr(0, 4);
-            string suffix = third_arg.substr(third_arg.size() - 3);
+        for (int i = 2; i < argc; ++i) {
+            string arg = string(argv[i]);
+
+            if (STRCMPI(arg.c_str(), "--codec") == 0 || STRCMPI(arg.c_str(), "-c") == 0) {
+                if (i + 1 >= argc || !parse_codec_arg(string(argv[i + 1]), &data.videoCodec)) {
+                    LOG_ERROR("Invalid codec. Supported codecs are h264 and h265.");
+                    return 1;
+                }
+                ++i;
+                continue;
+            }
+
+            if (arg[0] == '-') {
+                if (is_live_option(arg)) {
+                    ++i;
+                }
+                continue;
+            }
+
+            string prefix = arg.substr(0, MIN(static_cast<size_t>(4), arg.size()));
+            string suffix = arg.size() >= 3 ? arg.substr(arg.size() - 3) : "";
             if (prefix.compare("rtsp") == 0) {
                 data.streamSource = RTSP_SOURCE;
-                data.rtsp_url = string(argv[2]);
+                data.rtsp_url = arg;
+                continue;
+            }
 
-            } else if (suffix.compare("mkv") == 0 ||
-                       suffix.compare("mp4") == 0 ||
-                       suffix.compare(".ts") == 0) {
-                data.streamSource = FILE_SOURCE;
-                // skip over stream name
-                for(int i = 2; i < argc; ++i) {
-                    string file_path = string(argv[i]);
-                    // file path should be at least 4 char (shortest example: a.ts)
-                    if (file_path.size() < 4) {
-                        LOG_ERROR("Invalid file path");
-                        return 1;
-                    }
-                    FileInfo fileInfo;
-                    fileInfo.path = file_path;
-                    data.file_list.push_back(fileInfo);
+            if (suffix.compare("mkv") == 0 ||
+                suffix.compare("mp4") == 0 ||
+                suffix.compare(".ts") == 0) {
+                if (data.streamSource != FILE_SOURCE) {
+                    data.streamSource = FILE_SOURCE;
                 }
+
+                FileInfo fileInfo;
+                fileInfo.path = arg;
+                data.file_list.push_back(fileInfo);
             }
         }
+    }
+
+    if (data.videoCodec == VIDEO_CODEC_H265 &&
+        data.streamSource != RTSP_SOURCE) {
+        LOG_ERROR("H.265 is currently supported only for RTSP input in kvs_gstreamer_sample.");
+        return 1;
     }
 
     /* init Kinesis Video */
