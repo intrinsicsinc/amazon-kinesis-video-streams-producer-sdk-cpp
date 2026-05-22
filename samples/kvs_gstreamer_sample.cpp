@@ -62,6 +62,11 @@ typedef enum _VideoCodec {
     VIDEO_CODEC_H265
 } VideoCodec;
 
+typedef enum _RtspTransportMode {
+    RTSP_TRANSPORT_MODE_TCP,
+    RTSP_TRANSPORT_MODE_UDP
+} RtspTransportMode;
+
 typedef struct _FileInfo {
     _FileInfo():
             path(""),
@@ -84,7 +89,8 @@ typedef struct _CustomData {
             main_loop(NULL),
             first_pts(GST_CLOCK_TIME_NONE),
             use_absolute_fragment_times(true),
-            videoCodec(VIDEO_CODEC_H264) {
+            videoCodec(VIDEO_CODEC_H264),
+            rtspTransportMode(RTSP_TRANSPORT_MODE_TCP) {
         producer_start_time = chrono::duration_cast<nanoseconds>(systemCurrentTime().time_since_epoch()).count();
     }
 
@@ -143,6 +149,8 @@ typedef struct _CustomData {
     uint64_t first_pts;
 
     VideoCodec videoCodec;
+
+    RtspTransportMode rtspTransportMode;
 } CustomData;
 
 static bool is_h265_codec(const string& codec) {
@@ -161,6 +169,20 @@ static bool parse_codec_arg(const string& codec, VideoCodec* videoCodec) {
 
     if (is_h265_codec(codec)) {
         *videoCodec = VIDEO_CODEC_H265;
+        return true;
+    }
+
+    return false;
+}
+
+static bool parse_rtsp_transport_arg(const string& transport, RtspTransportMode* rtspTransportMode) {
+    if (STRCMPI(transport.c_str(), "tcp") == 0) {
+        *rtspTransportMode = RTSP_TRANSPORT_MODE_TCP;
+        return true;
+    }
+
+    if (STRCMPI(transport.c_str(), "udp") == 0) {
+        *rtspTransportMode = RTSP_TRANSPORT_MODE_UDP;
         return true;
     }
 
@@ -188,6 +210,11 @@ static const char* get_content_type(VideoCodec videoCodec) {
 
 static const char* get_codec_id(VideoCodec videoCodec) {
     return videoCodec == VIDEO_CODEC_H265 ? DEFAULT_CODEC_ID_H265 : DEFAULT_CODEC_ID;
+}
+
+static guint get_rtsp_source_protocols(RtspTransportMode rtspTransportMode) {
+    // Match GstRTSPLowerTrans flag values without adding another GStreamer pkg-config dependency.
+    return rtspTransportMode == RTSP_TRANSPORT_MODE_UDP ? 1u : 4u;
 }
 
 namespace com { namespace amazonaws { namespace kinesis { namespace video {
@@ -992,6 +1019,7 @@ int gstreamer_rtsp_source_init(CustomData *data, GstElement *pipeline) {
     // configure rtspsrc
     g_object_set(G_OBJECT (source),
                  "location", data->rtsp_url.c_str(),
+                 "protocols", get_rtsp_source_protocols(data->rtspTransportMode),
                  "short-header", true, // Necessary for target camera
                  NULL);
 
@@ -1154,7 +1182,7 @@ int main(int argc, char* argv[]) {
         LOG_ERROR(
                 "Usage: AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name -w width -h height -f framerate -b bitrateInKBPS\n \
            or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name\n \
-           or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name rtsp-url [--codec h264|h265]\n \
+           or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name rtsp-url [--codec h264|h265] [--rtsp-transport tcp|udp]\n \
            or AWS_ACCESS_KEY_ID=SAMPLEKEY AWS_SECRET_ACCESS_KEY=SAMPLESECRET ./kinesis_video_gstreamer_sample_app my-stream-name path/to/file1 path/to/file2 ...\n");
         return 1;
     }
@@ -1179,6 +1207,15 @@ int main(int argc, char* argv[]) {
             if (STRCMPI(arg.c_str(), "--codec") == 0 || STRCMPI(arg.c_str(), "-c") == 0) {
                 if (i + 1 >= argc || !parse_codec_arg(string(argv[i + 1]), &data.videoCodec)) {
                     LOG_ERROR("Invalid codec. Supported codecs are h264 and h265.");
+                    return 1;
+                }
+                ++i;
+                continue;
+            }
+
+            if (STRCMPI(arg.c_str(), "--rtsp-transport") == 0) {
+                if (i + 1 >= argc || !parse_rtsp_transport_arg(string(argv[i + 1]), &data.rtspTransportMode)) {
+                    LOG_ERROR("Invalid RTSP transport. Supported transports are tcp and udp.");
                     return 1;
                 }
                 ++i;
