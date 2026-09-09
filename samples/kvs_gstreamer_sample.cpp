@@ -500,7 +500,7 @@ STATUS
 SampleStreamCallbackProvider::fragmentAckReceivedHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
                                                          UPLOAD_HANDLE upload_handle, PFragmentAck pFragmentAck) {
     CustomData *data = reinterpret_cast<CustomData *>(custom_data);
-    if (data->streamSource == FILE_SOURCE && pFragmentAck->ackType == FRAGMENT_ACK_TYPE_PERSISTED) {
+    if (data->streamSource == FILE_SOURCE && pFragmentAck != NULL && pFragmentAck->ackType == FRAGMENT_ACK_TYPE_PERSISTED) {
         std::unique_lock<std::mutex> lk(data->file_list_mtx);
         uint32_t last_unpersisted_file_idx = data->last_unpersisted_file_idx.load();
         uint64_t last_frag_ts = data->file_list.at(last_unpersisted_file_idx).last_fragment_ts /
@@ -511,13 +511,17 @@ SampleStreamCallbackProvider::fragmentAckReceivedHandler(UINT64 custom_data, STR
         }
     }
     // Tests whether ACK flow pauses during spikes and which ACK type resumes first.
-    log_diag("event=fragment_ack stream_handle=" + to_string(stream_handle) +
-             " upload_handle=" + to_string(upload_handle) +
-             " ack_type=" + ack_type_to_string(pFragmentAck->ackType) +
-             " ack_timecode_ms=" + to_string(hundreds_of_nanos_to_ms(pFragmentAck->timestamp)) +
-             " result_hex=0x" + status_to_hex(pFragmentAck->result) +
-             " monotonic_ms=" + to_string(now_monotonic_ms()));
-    LOG_DEBUG("Reporting fragment ack received. Ack timecode " << pFragmentAck->timestamp);
+    // This sample already treats FragmentAck.timestamp as stream timecode units (milliseconds
+    // with DEFAULT_TIMECODE_SCALE_MILLISECONDS), so do not convert it from 100ns units.
+    if (pFragmentAck != NULL) {
+        log_diag("event=fragment_ack stream_handle=" + to_string(stream_handle) +
+                 " upload_handle=" + to_string(upload_handle) +
+                 " ack_type=" + ack_type_to_string(pFragmentAck->ackType) +
+                 " ack_timecode_ms=" + to_string(pFragmentAck->timestamp) +
+                 " result_hex=0x" + status_to_hex(pFragmentAck->result) +
+                 " monotonic_ms=" + to_string(now_monotonic_ms()));
+        LOG_DEBUG("Reporting fragment ack received. Ack timecode " << pFragmentAck->timestamp);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -560,21 +564,20 @@ STATUS put_frame(shared_ptr<KinesisVideoStream> kinesis_video_stream, void *data
 }
 
 static GstFlowReturn on_new_sample(GstElement *sink, CustomData *data) {
-    GstBuffer *buffer;
+    GstBuffer *buffer = nullptr;
     bool isDroppable, isHeader, delta;
     size_t buffer_size;
     GstFlowReturn ret = GST_FLOW_OK;
     STATUS curr_stream_status = data->stream_status.load();
     GstSample *sample = nullptr;
     GstMapInfo info;
+    info.data = nullptr;
 
     if (STATUS_FAILED(curr_stream_status)) {
         LOG_ERROR("Received stream error: " << curr_stream_status);
-        ret = GST_FLOW_ERROR;
-        goto CleanUp;
+        return GST_FLOW_ERROR;
     }
 
-    info.data = nullptr;
     sample = gst_app_sink_pull_sample(GST_APP_SINK (sink));
 
     // capture cpd at the first frame
