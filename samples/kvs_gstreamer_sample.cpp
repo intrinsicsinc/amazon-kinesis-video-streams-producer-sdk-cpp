@@ -7,6 +7,7 @@
 #include <vector>
 #include <stdlib.h>
 #include <mutex>
+#include <sstream>
 #include <IotCertCredentialProvider.h>
 
 using namespace std;
@@ -88,6 +89,7 @@ typedef struct _CustomData {
             key_frame_pts(0),
             main_loop(NULL),
             first_pts(GST_CLOCK_TIME_NONE),
+            last_raw_pts(GST_CLOCK_TIME_NONE),
             use_absolute_fragment_times(true),
             videoCodec(VIDEO_CODEC_H264),
             rtspTransportMode(RTSP_TRANSPORT_MODE_TCP) {
@@ -147,6 +149,10 @@ typedef struct _CustomData {
 
     // Pts of first video frame
     uint64_t first_pts;
+
+    // Keep the raw source cadence alongside adjusted producer timestamps so latency spikes can be
+    // separated into source-side jumps versus upload-side queueing.
+    uint64_t last_raw_pts;
 
     VideoCodec videoCodec;
 
@@ -217,6 +223,45 @@ static guint get_rtsp_source_protocols(RtspTransportMode rtspTransportMode) {
     return rtspTransportMode == RTSP_TRANSPORT_MODE_UDP ? 1u : 4u;
 }
 
+static uint64_t now_monotonic_ms() {
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+static uint64_t hundreds_of_nanos_to_ms(uint64_t value) {
+    return value / HUNDREDS_OF_NANOS_IN_A_MILLISECOND;
+}
+
+static uint64_t gst_time_to_ms(uint64_t value) {
+    return value / static_cast<uint64_t>(GST_MSECOND);
+}
+
+static string status_to_hex(uint64_t value) {
+    ostringstream stream;
+    stream << std::hex << value;
+    return stream.str();
+}
+
+static const char* ack_type_to_string(UINT32 ack_type) {
+    switch (ack_type) {
+        case FRAGMENT_ACK_TYPE_BUFFERING:
+            return "buffering";
+        case FRAGMENT_ACK_TYPE_RECEIVED:
+            return "received";
+        case FRAGMENT_ACK_TYPE_PERSISTED:
+            return "persisted";
+        case FRAGMENT_ACK_TYPE_ERROR:
+            return "error";
+        case FRAGMENT_ACK_TYPE_IDLE:
+            return "idle";
+        default:
+            return "unknown";
+    }
+}
+
+static void log_diag(const string& message) {
+    LOG_INFO("[KVS_DIAG] " << message);
+}
+
 namespace com { namespace amazonaws { namespace kinesis { namespace video {
 
 class SampleClientCallbackProvider : public ClientCallbackProvider {
@@ -250,8 +295,24 @@ public:
         return streamErrorReportHandler;
     };
 
+    StreamLatencyPressureFunc getStreamLatencyPressureCallback() override {
+        return streamLatencyPressureHandler;
+    };
+
     DroppedFrameReportFunc getDroppedFrameReportCallback() override {
         return droppedFrameReportHandler;
+    };
+
+    DroppedFragmentReportFunc getDroppedFragmentReportCallback() override {
+        return droppedFragmentReportHandler;
+    };
+
+    StreamClosedFunc getStreamClosedCallback() override {
+        return streamClosedHandler;
+    };
+
+    BufferDurationOverflowPressureFunc getBufferDurationOverflowPressureCallback() override {
+        return bufferDurationOverflowPressureHandler;
     };
 
     FragmentAckReceivedFunc getFragmentAckReceivedCallback() override {
@@ -268,8 +329,23 @@ private:
                              STATUS status_code);
 
     static STATUS
+    streamLatencyPressureHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
+                                 UINT64 current_buffer_duration);
+
+    static STATUS
     droppedFrameReportHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
                               UINT64 dropped_frame_timecode);
+
+    static STATUS
+    droppedFragmentReportHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
+                                 UINT64 dropped_fragment_timecode);
+
+    static STATUS
+    streamClosedHandler(UINT64 custom_data, STREAM_HANDLE stream_handle, UPLOAD_HANDLE upload_handle);
+
+    static STATUS
+    bufferDurationOverflowPressureHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
+                                          UINT64 remaining_duration);
 
     static STATUS
     fragmentAckReceivedHandler( UINT64 custom_data, STREAM_HANDLE stream_handle,
@@ -309,6 +385,8 @@ public:
 STATUS
 SampleClientCallbackProvider::storageOverflowPressure(UINT64 custom_handle, UINT64 remaining_bytes) {
     UNUSED_PARAM(custom_handle);
+    // Tests whether host/storage pressure is forcing the SDK to evict queued media.
+    log_diag("event=storage_overflow bytes_remaining=" + to_string(remaining_bytes));
     LOG_WARN("Reporting storage overflow. Bytes remaining " << remaining_bytes);
     return STATUS_SUCCESS;
 }
@@ -316,6 +394,11 @@ SampleClientCallbackProvider::storageOverflowPressure(UINT64 custom_handle, UINT
 STATUS SampleStreamCallbackProvider::streamConnectionStaleHandler(UINT64 custom_data,
                                                                   STREAM_HANDLE stream_handle,
                                                                   UINT64 last_buffering_ack) {
+    UNUSED_PARAM(custom_data);
+    // Tests whether PutMedia stops receiving buffering ACKs while source frames keep arriving.
+    log_diag("event=stale stream_handle=" + to_string(stream_handle) +
+             " last_buffering_ack_ms=" + to_string(hundreds_of_nanos_to_ms(last_buffering_ack)) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
     LOG_WARN("Reporting stream stale. Last ACK received " << last_buffering_ack);
     return STATUS_SUCCESS;
 }
@@ -323,6 +406,12 @@ STATUS SampleStreamCallbackProvider::streamConnectionStaleHandler(UINT64 custom_
 STATUS
 SampleStreamCallbackProvider::streamErrorReportHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
                                                        UPLOAD_HANDLE upload_handle, UINT64 errored_timecode, STATUS status_code) {
+    // Tests whether KVS explicitly errors the upload session instead of the stream silently queueing.
+    log_diag("event=stream_error stream_handle=" + to_string(stream_handle) +
+             " upload_handle=" + to_string(upload_handle) +
+             " errored_timecode_ms=" + to_string(hundreds_of_nanos_to_ms(errored_timecode)) +
+             " status_hex=0x" + status_to_hex(status_code) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
     LOG_ERROR("Reporting stream error. Errored timecode: " << errored_timecode << " Status: "
                                                            << status_code);
     CustomData *data = reinterpret_cast<CustomData *>(custom_data);
@@ -348,9 +437,62 @@ SampleStreamCallbackProvider::streamErrorReportHandler(UINT64 custom_data, STREA
 }
 
 STATUS
+SampleStreamCallbackProvider::streamLatencyPressureHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
+                                                           UINT64 current_buffer_duration) {
+    UNUSED_PARAM(custom_data);
+    // Tests whether the SDK backlog grows toward the 60s max-latency threshold before recovery.
+    log_diag("event=latency_pressure stream_handle=" + to_string(stream_handle) +
+             " current_buffer_ms=" + to_string(hundreds_of_nanos_to_ms(current_buffer_duration)) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
+    LOG_WARN("Reporting stream latency pressure. Current buffer duration " << current_buffer_duration);
+    return STATUS_SUCCESS;
+}
+
+STATUS
 SampleStreamCallbackProvider::droppedFrameReportHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
                                                         UINT64 dropped_frame_timecode) {
+    UNUSED_PARAM(custom_data);
+    // Tests whether the SDK is dropping stale frames before they ever reach KVS.
+    log_diag("event=dropped_frame stream_handle=" + to_string(stream_handle) +
+             " frame_timecode_ms=" + to_string(hundreds_of_nanos_to_ms(dropped_frame_timecode)) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
     LOG_WARN("Reporting dropped frame. Frame timecode " << dropped_frame_timecode);
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SampleStreamCallbackProvider::droppedFragmentReportHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
+                                                           UINT64 dropped_fragment_timecode) {
+    UNUSED_PARAM(custom_data);
+    // Tests whether whole fragments are discarded during recovery or prolonged queue pressure.
+    log_diag("event=dropped_fragment stream_handle=" + to_string(stream_handle) +
+             " fragment_timecode_ms=" + to_string(hundreds_of_nanos_to_ms(dropped_fragment_timecode)) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
+    LOG_WARN("Reporting dropped fragment. Fragment timecode " << dropped_fragment_timecode);
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SampleStreamCallbackProvider::streamClosedHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
+                                                  UPLOAD_HANDLE upload_handle) {
+    UNUSED_PARAM(custom_data);
+    // Tests whether a large producer timestamp jump lines up with the SDK closing a PutMedia session.
+    log_diag("event=stream_closed stream_handle=" + to_string(stream_handle) +
+             " upload_handle=" + to_string(upload_handle) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
+    LOG_INFO("Reporting stream closed. Upload handle " << upload_handle);
+    return STATUS_SUCCESS;
+}
+
+STATUS
+SampleStreamCallbackProvider::bufferDurationOverflowPressureHandler(UINT64 custom_data, STREAM_HANDLE stream_handle,
+                                                                    UINT64 remaining_duration) {
+    UNUSED_PARAM(custom_data);
+    // Tests whether the queue is approaching full temporal-buffer exhaustion rather than a brief network hiccup.
+    log_diag("event=buffer_pressure stream_handle=" + to_string(stream_handle) +
+             " remaining_buffer_ms=" + to_string(hundreds_of_nanos_to_ms(remaining_duration)) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
+    LOG_WARN("Reporting buffer duration overflow pressure. Remaining duration " << remaining_duration);
     return STATUS_SUCCESS;
 }
 
@@ -368,6 +510,13 @@ SampleStreamCallbackProvider::fragmentAckReceivedHandler(UINT64 custom_data, STR
             LOG_INFO("Successfully persisted file " << data->file_list.at(last_unpersisted_file_idx).path);
         }
     }
+    // Tests whether ACK flow pauses during spikes and which ACK type resumes first.
+    log_diag("event=fragment_ack stream_handle=" + to_string(stream_handle) +
+             " upload_handle=" + to_string(upload_handle) +
+             " ack_type=" + ack_type_to_string(pFragmentAck->ackType) +
+             " ack_timecode_ms=" + to_string(hundreds_of_nanos_to_ms(pFragmentAck->timestamp)) +
+             " result_hex=0x" + status_to_hex(pFragmentAck->result) +
+             " monotonic_ms=" + to_string(now_monotonic_ms()));
     LOG_DEBUG("Reporting fragment ack received. Ack timecode " << pFragmentAck->timestamp);
     return STATUS_SUCCESS;
 }
@@ -440,6 +589,10 @@ static GstFlowReturn on_new_sample(GstElement *sink, CustomData *data) {
     }
 
     buffer = gst_sample_get_buffer(sample);
+    const uint64_t raw_pts = GST_BUFFER_PTS_IS_VALID(buffer) ? buffer->pts : GST_CLOCK_TIME_NONE;
+    const uint64_t raw_pts_gap_ms = (raw_pts != GST_CLOCK_TIME_NONE && data->last_raw_pts != GST_CLOCK_TIME_NONE)
+        ? gst_time_to_ms(raw_pts - data->last_raw_pts)
+        : 0;
     isHeader = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_HEADER);
     isDroppable = GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_CORRUPTED) ||
                   GST_BUFFER_FLAG_IS_SET(buffer, GST_BUFFER_FLAG_DECODE_ONLY) ||
@@ -483,10 +636,45 @@ static GstFlowReturn on_new_sample(GstElement *sink, CustomData *data) {
             goto CleanUp;
         }
 
-        put_frame(data->kinesis_video_stream, info.data, info.size, std::chrono::nanoseconds(buffer->pts),
-                               std::chrono::nanoseconds(buffer->dts), kinesis_video_flags);
+        const uint64_t raw_pts_ms = raw_pts == GST_CLOCK_TIME_NONE ? 0 : gst_time_to_ms(raw_pts);
+        const uint64_t adjusted_pts_ms = gst_time_to_ms(buffer->pts);
+        const uint64_t adjusted_dts_ms = gst_time_to_ms(buffer->dts);
+        const uint64_t put_start_ms = now_monotonic_ms();
+        STATUS put_status = put_frame(data->kinesis_video_stream, info.data, info.size, std::chrono::nanoseconds(buffer->pts),
+                                      std::chrono::nanoseconds(buffer->dts), kinesis_video_flags);
+        const uint64_t put_duration_ms = now_monotonic_ms() - put_start_ms;
+        if (raw_pts != GST_CLOCK_TIME_NONE) {
+            data->last_raw_pts = raw_pts;
+        }
 
         if (CHECK_FRAME_FLAG_KEY_FRAME(kinesis_video_flags)) {
+            // This compact line is meant for remote operators reading raw logs without analysis tools.
+            // It answers whether a spike started at source PTS cadence, inside the SDK queue, or at upload/ACK time.
+            try {
+                auto stream_metrics = data->kinesis_video_stream->getMetrics();
+                auto client_metrics = data->kinesis_video_producer->getMetrics();
+                ostringstream health;
+                health << "event=health"
+                       << " stream=" << data->stream_name
+                       << " source=" << (data->streamSource == RTSP_SOURCE ? "rtsp" : data->streamSource == FILE_SOURCE ? "file" : "live")
+                       << " keyframe=1"
+                       << " raw_pts_ms=" << raw_pts_ms
+                       << " raw_gap_ms=" << raw_pts_gap_ms
+                       << " producer_pts_ms=" << adjusted_pts_ms
+                       << " dts_ms=" << adjusted_dts_ms
+                       << " frame_size_bytes=" << info.size
+                       << " put_status_hex=0x" << std::hex << put_status << std::dec
+                       << " put_duration_ms=" << put_duration_ms
+                       << " sdk_view_ms=" << stream_metrics.getCurrentViewDuration().count()
+                       << " sdk_view_bytes=" << stream_metrics.getCurrentViewSize()
+                       << " sdk_transfer_bps=" << (8 * stream_metrics.getCurrentTransferRate())
+                       << " sdk_contentstore_available_bytes=" << client_metrics.getContentStoreAvailableSize()
+                       << " sdk_contentstore_allocated_bytes=" << client_metrics.getContentStoreAllocatedSize();
+                log_diag(health.str());
+            } catch (runtime_error &err) {
+                log_diag("event=health_metrics_error stream=" + string(data->stream_name) +
+                         " message=" + string(err.what()));
+            }
             data->kinesis_video_stream->putEventMetadata(STREAM_EVENT_TYPE_NOTIFICATION | STREAM_EVENT_TYPE_IMAGE_GENERATION, NULL);
         }
     }
@@ -622,6 +810,12 @@ void kinesis_video_init(CustomData *data) {
                                                                     API_CALL_CACHE_TYPE_ALL,
                                                                     defaultRegionStr);
 
+    log_diag("event=client_ready stream=" + string(data->stream_name) +
+             " region=" + defaultRegionStr +
+             " buffer_duration_s=" + to_string(DEFAULT_BUFFER_DURATION_SECONDS) +
+             " max_latency_s=" + to_string(DEFAULT_MAX_LATENCY_SECONDS) +
+             " replay_duration_s=" + to_string(DEFAULT_REPLAY_DURATION_SECONDS) +
+             " staleness_s=" + to_string(DEFAULT_CONNECTION_STALENESS_SECONDS));
     LOG_DEBUG("Client is ready");
 }
 
@@ -1126,6 +1320,7 @@ int gstreamer_init(int argc, char* argv[], CustomData *data) {
 
     // Reset first frame pts
     data->first_pts = GST_CLOCK_TIME_NONE;
+    data->last_raw_pts = GST_CLOCK_TIME_NONE;
 
     switch (data->streamSource) {
         case LIVE_SOURCE:
